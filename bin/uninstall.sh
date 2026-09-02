@@ -1835,7 +1835,7 @@ main() {
         local _pressed=false
         while [[ $_countdown -gt 0 ]]; do
             printf "\r${GRAY}Press Enter to return to the app list, press q to exit (%d)${NC} " "$_countdown"
-            if IFS= read -r -s -n1 -t 1 _key; then
+            if IFS= read -r -s -n1 -t 1 _key 2> /dev/null; then
                 _pressed=true
                 break
             fi

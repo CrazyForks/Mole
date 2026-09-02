@@ -3273,6 +3273,62 @@ INNER
     [ "$status" -eq 0 ]
 }
 
+@test "completed uninstall suppresses dead-terminal countdown read errors (#1503)" {
+    local apps_cache
+    apps_cache="$(mktemp "${BATS_TEST_TMPDIR:-$BATS_RUN_TMPDIR:-$HOME}/tmp-1503-countdown.XXXXXX")"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" APPS_CACHE_FILE="$apps_cache" \
+        /bin/bash --noprofile --norc << 'INNER'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+
+log_operation_session_start() { :; }
+hide_cursor() { :; }
+show_cursor() { :; }
+clear_screen() { :; }
+start_uninstall_interactive_screen() { :; }
+stop_uninstall_interactive_screen() { :; }
+scan_applications() { printf '%s\n' "$APPS_CACHE_FILE"; }
+load_applications() { :; }
+select_apps_for_uninstall() {
+    selected_apps=("0|$HOME/Applications/TestApp.app|TestApp|com.example.TestApp|1KB|Today|1")
+}
+batch_uninstall_applications() { :; }
+uninstall_app_inventory_fingerprint() { printf 'stable\n'; }
+uninstall_normalize_size_display() { printf '%s\n' "$1"; }
+uninstall_normalize_last_used_display() { printf '%s\n' "$1"; }
+get_display_width() { printf '%s\n' "${#1}"; }
+truncate_by_display_width() { printf '%s\n' "$1"; }
+mole_tty_is_foreground() { return 0; }
+drain_pending_input() { :; }
+read() {
+    local arg
+    for arg in "$@"; do
+        if [[ "$arg" == -t || "$arg" == -t* ]]; then
+            printf 'read error: 0: Input/output error\n' >&2
+            return 1
+        fi
+    done
+    builtin read "$@"
+}
+
+eval "$(sed -n '/^main()/,/main \"\$@\"/p' "$PROJECT_ROOT/bin/uninstall.sh" | sed '$d')"
+main > "$HOME/countdown.out" 2> "$HOME/countdown.err"
+
+[[ "$(cat "$HOME/countdown.err")" != *'Input/output error'* ]] || {
+    cat "$HOME/countdown.err" >&2
+    exit 1
+}
+[[ "$(grep -o 'Press Enter to return to the app list' "$HOME/countdown.out" | wc -l | tr -d ' ')" -eq 5 ]]
+INNER
+
+    rm -f "$apps_cache"
+    [ "$status" -eq 0 ] || {
+        echo "$output"
+        return 1
+    }
+}
+
 @test "inventory cache reuse accepts removals only and rejects stale changes (#1315)" {
     run env HOME="$HOME/inventory-reuse" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'INNER'
 set -euo pipefail
