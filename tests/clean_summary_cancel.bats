@@ -192,6 +192,10 @@ EOF
     [[ "$output" == *"2 item(s) exceeded the 30s removal budget"* ]] || return 1
     [[ "$output" == *"XCTestDevices/clone-one"* ]] || return 1
     [[ "$output" == *"XCTestDevices/clone-two"* ]] || return 1
+    # Abbreviated to ~: three absolute paths under the home directory run past
+    # the one line this note is capped to.
+    [[ "$output" == *"~/Library/Developer/XCTestDevices/clone-one"* ]] || { echo "$output"; return 1; }
+    [[ "$output" != *"$HOME/Library/Developer/XCTestDevices/clone-one"* ]] || { echo "$output"; return 1; }
 }
 
 @test "sizing timeouts still clean and the summary reports the under-count (#1374)" {
