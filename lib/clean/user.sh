@@ -55,10 +55,10 @@ clean_trash() {
             local trash_item
             while IFS= read -r -d '' trash_item; do
                 [[ -e "$trash_item" ]] || continue
-                if should_protect_path "$trash_item" 2> /dev/null ||
-                    is_path_whitelisted "$trash_item" 2> /dev/null ||
+                if is_path_whitelisted "$trash_item" 2> /dev/null ||
                     (declare -f holds_compiled_model_cache > /dev/null 2>&1 &&
-                        holds_compiled_model_cache "$trash_item" 2> /dev/null); then
+                        holds_compiled_model_cache "$trash_item" 2> /dev/null) ||
+                    ! validate_path_for_deletion "$trash_item" 2> /dev/null; then
                     continue
                 fi
                 local trash_item_kb
