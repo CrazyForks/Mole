@@ -969,7 +969,10 @@ clean_app_caches() {
     # recoverable user documents, not only disposable cache data.
     safe_clean ~/Library/IdentityCaches/* "Identity caches" || true
     safe_clean ~/Library/Suggestions/* "Siri suggestions cache" || true
-    safe_clean ~/Library/Calendars/Calendar\ Cache "Calendar cache" || true
+    # Do not clean ~/Library/Calendars/Calendar Cache*: CalendarAgent keeps this
+    # SQLite index open in the background. Deleting it while the daemon is
+    # running can crash Calendar.app until logout/login (#1508). Apple treats
+    # this as a manual troubleshooting step, not routine cache maintenance.
     safe_clean ~/Library/Application\ Support/AddressBook/Sources/*/Photos.cache "Address Book photo cache" || true
     clean_support_app_data
 

@@ -674,6 +674,27 @@ EOF
     [[ "$output" != *"Library/Autosave Information"* ]]
 }
 
+@test "clean_app_caches does not clean Calendar cache (#1508)" {
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+stop_section_spinner() { :; }
+start_section_spinner() { :; }
+safe_clean() { echo "$2|$1"; }
+bytes_to_human() { echo "0B"; }
+note_activity() { :; }
+files_cleaned=0
+total_size_cleaned=0
+total_items=0
+clean_app_caches
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"Calendar cache"* ]] || return 1
+    [[ "$output" != *"Library/Calendars/Calendar Cache"* ]]
+}
+
 @test "clean_app_caches includes additional Apple cache families" {
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
 set -euo pipefail
