@@ -1454,8 +1454,6 @@ start_cleanup() {
     export MOLE_CLEAN_REMOVAL_TIMEOUTS
     MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS=""
     export MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS
-    MOLE_CLEAN_SECTION_BUDGET_HIT=0
-    export MOLE_CLEAN_SECTION_BUDGET_HIT
     _MOLE_CLEAN_SECTION_DEADLINE=""
     log_operation_session_start "clean"
     DRY_RUN_SEEN_IDENTITIES=()
@@ -1849,8 +1847,6 @@ perform_cleanup() {
         elif [[ $cleanup_cancel_rc -ge 128 ]]; then
             summary_details+=("${GRAY}${ICON_WARNING}${NC} Cancelled: a cleanup step was interrupted (exit $cleanup_cancel_rc). Remaining cleanup was skipped.")
         fi
-    elif [[ "${MOLE_CLEAN_SECTION_BUDGET_HIT:-0}" == "1" ]]; then
-        summary_details+=("${GRAY}${ICON_WARNING}${NC} Cloud & Office · time limit reached, skipped remaining items")
     fi
 
     # Emit one "Free space" line, with the measured delta in parentheses when
@@ -2033,18 +2029,16 @@ run_with_shell_timeout() {
 run_cloud_and_office_cleanup() {
     local cleanup_rc=0
     local pending_clean_cancel=0
-    local previous_deadline="${_MOLE_CLEAN_SECTION_DEADLINE:-}"
-    local section_deadline=$((SECONDS + MOLE_CLOUD_OFFICE_SECTION_BUDGET_SEC))
-    _MOLE_CLEAN_SECTION_DEADLINE=$section_deadline
+    _MOLE_CLEAN_SECTION_DEADLINE=$((SECONDS + MOLE_CLOUD_OFFICE_SECTION_BUDGET_SEC))
 
     clean_cloud_storage || cleanup_rc=$?
     pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
-    if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
-        _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
-        return "$cleanup_rc"
-    fi
-    if [[ $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
-        _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
+    if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ||
+        $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
+        _MOLE_CLEAN_SECTION_DEADLINE=""
+        if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
+            return "$cleanup_rc"
+        fi
         return "$pending_clean_cancel"
     fi
 
@@ -2052,29 +2046,22 @@ run_cloud_and_office_cleanup() {
         cleanup_rc=0
         clean_office_applications || cleanup_rc=$?
         pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
-        if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
-            _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
-            return "$cleanup_rc"
-        fi
-        if [[ $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
-            _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
+        if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ||
+            $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
+            _MOLE_CLEAN_SECTION_DEADLINE=""
+            if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
+                return "$cleanup_rc"
+            fi
             return "$pending_clean_cancel"
         fi
     fi
 
-    local budget_hit=0
-    if [[ $SECONDS -ge $section_deadline ]]; then
-        budget_hit=1
+    if _mole_clean_section_budget_spent; then
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Cloud & Office · ${GRAY}time limit reached, skipped remaining items${NC}"
+        note_activity
     fi
 
-    _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
-
-    if [[ $budget_hit -eq 1 ]]; then
-        report_cloud_office_budget_reached
-        MOLE_CLEAN_SECTION_BUDGET_HIT=1
-        export MOLE_CLEAN_SECTION_BUDGET_HIT
-    fi
-
+    _MOLE_CLEAN_SECTION_DEADLINE=""
     return 0
 }
 

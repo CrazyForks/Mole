@@ -925,7 +925,7 @@ clean_developer_tools() {
 }
 
 perform_cleanup
-printf 'DEV=%s BUDGET=%s\n' "$developer_tools_called" "${MOLE_CLEAN_SECTION_BUDGET_HIT:-0}"
+printf 'DEV=%s\n' "$developer_tools_called"
 EOF
 
     [ "$status" -eq 0 ] || {
@@ -933,7 +933,6 @@ EOF
         return 1
     }
     [[ "$output" == *"DEV=true"* ]] || return 1
-    [[ "$output" == *"BUDGET=1"* ]] || return 1
     [[ "$output" == *"Cleanup complete"* ]] || return 1
     [[ "$output" != *"Cleanup cancelled"* ]] || return 1
     [[ "$output" == *"time limit reached, skipped remaining items"* ]] || return 1

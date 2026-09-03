@@ -90,16 +90,26 @@ clean_trash() {
     fi
 
     local cleaned_count=0
+    local skipped_count=0
     while IFS= read -r -d '' item; do
         if safe_remove "$item" true; then
             cleaned_count=$((cleaned_count + 1))
+        else
+            skipped_count=$((skipped_count + 1))
         fi
     done < <(command find "$HOME/.Trash" -mindepth 1 -maxdepth 1 -print0 2> /dev/null || true)
 
     [[ -t 1 ]] && stop_inline_spinner
 
     if [[ $cleaned_count -gt 0 ]]; then
-        echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $cleaned_count items"
+        if [[ $skipped_count -gt 0 ]]; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Trash · removed $cleaned_count items, $skipped_count skipped"
+        else
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Trash · emptied, $cleaned_count items"
+        fi
+        note_activity
+    elif [[ $skipped_count -gt 0 ]]; then
+        echo -e "  ${GRAY}${ICON_WARNING}${NC} Trash · $skipped_count items could not be removed"
         note_activity
     fi
 }
@@ -1867,13 +1877,6 @@ clean_cloud_storage() {
             "OneDrive cache" || true
     elif mole_cleanup_targets_exist "$HOME/Library/Caches/com.microsoft.OneDrive"; then
         echo -e "  ${GRAY}${ICON_WARNING}${NC} OneDrive cache · skipped (process state unknown)"
-        note_activity
-    fi
-}
-
-report_cloud_office_budget_reached() {
-    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Cloud & Office · ${GRAY}time limit reached, skipped remaining items${NC}"
-    if declare -F note_activity > /dev/null 2>&1; then
         note_activity
     fi
 }

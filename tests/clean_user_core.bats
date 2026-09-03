@@ -549,6 +549,38 @@ EOF
     [[ "$output" != *"osascript called"* ]]
 }
 
+@test "clean_trash reports skipped items instead of silent partial empty (#1517)" {
+    mkdir -p "$HOME/.Trash"
+    touch "$HOME/.Trash/one.tmp" "$HOME/.Trash/two.tmp"
+
+    run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" /bin/bash --noprofile --norc << 'EOF'
+set -euo pipefail
+source "$PROJECT_ROOT/lib/core/common.sh"
+source "$PROJECT_ROOT/lib/clean/user.sh"
+DRY_RUN=false
+start_section_spinner() { :; }
+stop_section_spinner() { :; }
+start_inline_spinner() { :; }
+stop_inline_spinner() { :; }
+note_activity() { :; }
+is_path_whitelisted() { return 1; }
+debug_log() { :; }
+safe_remove() {
+    local target="$1"
+    [[ "$target" == *"/two.tmp" ]] && return 1
+    rm -f "$target"
+    return 0
+}
+
+clean_trash
+EOF
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Trash · removed 1 items, 1 skipped"* ]] || return 1
+    [[ -e "$HOME/.Trash/two.tmp" ]]
+    [[ ! -e "$HOME/.Trash/one.tmp" ]]
+}
+
 @test "clean_user_essentials keeps Mole runtime logs while cleaning other user logs" {
     mkdir -p "$HOME/Library/Logs/mole"
     mkdir -p "$HOME/Library/Logs/OtherApp"
