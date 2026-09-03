@@ -1808,10 +1808,22 @@ clean_xcode_xctest_devices() {
         return 0
     fi
 
+    # Test clones accumulate one UUID directory per test run, so the root
+    # grows without bound and a single-tree removal can exceed the per-item
+    # removal budget after deleting only part of it. Delete each entry
+    # separately so the budget, sink guard, and sizing apply per clone. The
+    # root itself stays: Xcode recreates clones inside it.
+    local -a device_entries=()
+    local device_entry
+    while IFS= read -r -d '' device_entry; do
+        device_entries+=("$device_entry")
+    done < <(command find "$xctest_devices_dir" -mindepth 1 -maxdepth 1 -print0 2> /dev/null)
+    [[ ${#device_entries[@]} -gt 0 ]] || return 0
+
     _xcode_safe_clean_guarded \
         _xctest_devices_delete_guard_allows \
         "Xcode XCTestDevices" \
-        "$xctest_devices_dir" \
+        "${device_entries[@]}" \
         "Xcode XCTestDevices test data" || true
 }
 
@@ -2735,6 +2747,95 @@ _debug_simctl_probe_stderr() {
     debug_log "simctl probe $attempt stderr: $excerpt"
 }
 
+# Installed simulator runtimes that no device uses. Distinct from
+# clean_xcode_simulator_runtime_volumes (stale mount points) and from
+# unavailable-simulator cleanup (devices orphaned by a removed runtime):
+# this is the inverse, a runtime left behind after its last device went
+# away. Nothing in macOS or Xcode reports it, so an 8GB download can sit
+# unreferenced indefinitely.
+#
+# Review-only by design. A runtime is a toolchain payload that only Apple
+# can serve again, so it stays off the blanket delete path the same way
+# other downloaded toolchain roots do; the value here is naming the exact
+# orphan and the owner command, which is information the user cannot get
+# from simctl directly.
+check_orphaned_simulator_runtimes() {
+    command -v xcrun > /dev/null 2>&1 || return 0
+    [[ "${_MOLE_SIMCTL_RESOLUTION_STATUS:-}" == "ready" ]] || return 0
+
+    local runtime_list="" device_list="" probe_status=0
+    runtime_list=$(run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+        env DEVELOPER_DIR="$_MOLE_SIMCTL_DEVELOPER_DIR" xcrun simctl runtime list -v 2> /dev/null) || probe_status=$?
+    if [[ $probe_status -ne 0 ]]; then
+        [[ $probe_status -eq 124 || $probe_status -ge 128 ]] && return "$probe_status"
+        debug_log "Orphaned runtime probe failed (exit=$probe_status)"
+        return 0
+    fi
+
+    probe_status=0
+    device_list=$(run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" \
+        env DEVELOPER_DIR="$_MOLE_SIMCTL_DEVELOPER_DIR" xcrun simctl list devices 2> /dev/null) || probe_status=$?
+    if [[ $probe_status -ne 0 ]]; then
+        [[ $probe_status -eq 124 || $probe_status -ge 128 ]] && return "$probe_status"
+        debug_log "Orphaned runtime device probe failed (exit=$probe_status)"
+        return 0
+    fi
+
+    # `simctl runtime list -v` prints a header line per runtime followed by
+    # indented detail lines, one of which carries the on-disk size:
+    #   iOS 18.4 (22E238) - 70DF9A83-... (Ready)
+    #       Size: 8.2G
+    local current_name="" current_id="" current_size=""
+    local -a orphan_lines=()
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^([A-Za-z]+[[:space:]][0-9.]+)[[:space:]]\(.*\)[[:space:]]-[[:space:]]([0-9A-F-]{36}) ]]; then
+            # Flush the previous runtime before starting a new one.
+            _flush_orphan_runtime_candidate
+            current_name="${BASH_REMATCH[1]}"
+            current_id="${BASH_REMATCH[2]}"
+            current_size=""
+        elif [[ -n "$current_id" && "$line" =~ ^[[:space:]]+Size:[[:space:]]+(.+)$ ]]; then
+            current_size="${BASH_REMATCH[1]}"
+        fi
+    done <<< "$runtime_list"
+    _flush_orphan_runtime_candidate
+
+    # Expanding an empty array under `set -u` is an unbound-variable error on
+    # the bash 3.2 macOS ships, and "no orphans" is the common path.
+    [[ ${#orphan_lines[@]} -gt 0 ]] || return 0
+
+    local orphan
+    for orphan in "${orphan_lines[@]}"; do
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Orphaned simulator runtime · ${orphan}"
+        note_activity
+    done
+    return 0
+}
+
+# Helper for check_orphaned_simulator_runtimes' parse loop: decide whether
+# the runtime just parsed has zero devices, and if so queue a review line.
+# Reads/writes the caller's locals by design (bash 3.2 has no namerefs).
+_flush_orphan_runtime_candidate() {
+    [[ -n "$current_id" && -n "$current_name" ]] || return 0
+
+    # Devices are grouped under a "-- <runtime name> --" header. Count the
+    # non-empty lines in this runtime's group; zero means orphaned.
+    local device_count
+    device_count=$(printf '%s\n' "$device_list" | awk -v want="-- ${current_name} --" '
+        index($0, want) == 1 { f = 1; next }
+        /^-- / { f = 0 }
+        f && NF { c++ }
+        END { print c + 0 }')
+
+    if [[ "$device_count" -eq 0 ]]; then
+        local size_note="${current_size:+, $current_size}"
+        orphan_lines+=("${current_name}${size_note} · no devices · remove with ${GRAY}xcrun simctl runtime delete ${current_id}${NC}")
+    fi
+    current_id=""
+    current_name=""
+    current_size=""
+}
+
 clean_dev_mobile() {
     check_android_ndk
     clean_xcode_documentation_cache || return $?
@@ -2946,6 +3047,7 @@ clean_dev_mobile() {
             echo -e "  ${GRAY}${ICON_WARNING}${NC} Xcode unavailable simulators · simctl could not be resolved"
             note_activity
         fi
+        check_orphaned_simulator_runtimes || return $?
     fi
     # Old iOS/watchOS/tvOS DeviceSupport versions (debug symbols for connected devices).
     # Each iOS version creates a 1-3 GB folder of debug symbols. Only the versions
@@ -3816,6 +3918,64 @@ clean_claude_desktop_bundled_versions() {
             "$label" || clean_rc=$?
         [[ $clean_rc -eq 0 || $clean_rc -eq 1 ]] || return "$clean_rc"
     done
+}
+
+# Headless browser trees leaked by dead Playwright/agent automation sessions.
+# When an MCP server or agent harness dies without cleanup, its browser
+# daemons reparent to launchd (ppid 1) and the Chrome tree keeps running
+# headless, holding RSS; the ephemeral temp profiles keep disk. Only
+# processes tied to playwright_chromiumdev_profile-* automation profiles are
+# ever touched, never a user's real browser: orphaned Playwright daemons at
+# any age, browser processes only after a full day (a younger one may belong
+# to a live automation session).
+clean_dev_automation_browsers() {
+    local -a leaked_pids=()
+    local pid
+    while IFS= read -r pid; do
+        [[ -n "$pid" ]] && leaked_pids+=("$pid")
+    done < <(ps -Ao pid=,ppid=,etime=,command= 2> /dev/null | awk '
+        /playwright-core\/lib\/entry\/cliDaemon\.js/ && $2 == 1 { print $1; next }
+        /playwright_chromiumdev_profile/ && $3 ~ /-/ { print $1 }' | sort -un)
+
+    # Ephemeral automation profiles: stale after 2h, and never one that a
+    # live process still references.
+    local -a stale_profiles=()
+    local tmpdir
+    tmpdir=$(getconf DARWIN_USER_TEMP_DIR 2> /dev/null) || tmpdir=""
+    if [[ -n "$tmpdir" ]]; then
+        local d now age_hours
+        now=$(date +%s)
+        for d in "$tmpdir"playwright_chromiumdev_profile-*; do
+            [[ -d "$d" ]] || continue
+            age_hours=$(((now - $(stat -f %m "$d" 2> /dev/null || echo "$now")) / 3600))
+            [[ "$age_hours" -ge 2 ]] || continue
+            pgrep -qf "$d" 2> /dev/null && continue
+            stale_profiles+=("$d")
+        done
+    fi
+
+    if [[ ${#leaked_pids[@]} -gt 0 ]]; then
+        if [[ "$DRY_RUN" == "true" ]]; then
+            echo -e "  ${YELLOW}${ICON_DRY_RUN}${NC} Leaked automation browsers · would stop ${#leaked_pids[@]} processes ${YELLOW}dry${NC}"
+        else
+            local stopped=0
+            for pid in "${leaked_pids[@]}"; do
+                kill -TERM "$pid" 2> /dev/null && stopped=$((stopped + 1))
+            done
+            sleep 1
+            # Escalate for anything that ignored SIGTERM.
+            for pid in "${leaked_pids[@]}"; do
+                kill -0 "$pid" 2> /dev/null && kill -9 "$pid" 2> /dev/null || true
+            done
+            echo -e "  ${GREEN}${ICON_SUCCESS}${NC} Leaked automation browsers · stopped ${stopped} processes"
+        fi
+        note_activity
+    fi
+
+    if [[ ${#stale_profiles[@]} -gt 0 ]]; then
+        safe_clean "${stale_profiles[@]}" "Leaked browser profiles" || return $?
+    fi
+    return 0
 }
 
 clean_dev_ai_agents() {
@@ -5308,6 +5468,7 @@ clean_developer_tools() {
     _run_developer_cleanup_step clean_dev_jetbrains_toolbox || return $?
     _run_developer_cleanup_step clean_dev_jetbrains_logs || return $?
     _run_developer_cleanup_step --strict clean_dev_ai_agents || return $?
+    _run_developer_cleanup_step clean_dev_automation_browsers || return $?
     _run_developer_cleanup_step clean_dev_other_langs || return $?
     _run_developer_cleanup_step clean_dev_cicd || return $?
     _run_developer_cleanup_step clean_dev_database || return $?

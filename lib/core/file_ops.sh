@@ -37,6 +37,14 @@ if [[ -z "${MOLE_TIMEOUTS_LOADED:-}" ]]; then
     source "$_MOLE_CORE_DIR/timeouts.sh"
 fi
 
+# Keep the removal-timeout summary actionable: record which path ran out of
+# budget so the closing note can name it instead of a bare count.
+_mole_record_removal_timeout_path() {
+    local path="$1"
+    MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS="${MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS:+$MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS
+}$path"
+}
+
 # Bound production sudo commands while keeping shell-function mocks observable
 # in tests. Timeout behavior itself must use a PATH stub so it exercises the
 # same external-command branch that users run.
@@ -1548,6 +1556,7 @@ safe_remove() {
             # failed removal, not a user interrupt: count it and keep going so
             # one slow cache never cancels the remaining cleanup.
             MOLE_CLEAN_REMOVAL_TIMEOUTS=$((${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} + 1))
+            _mole_record_removal_timeout_path "$path"
         fi
         return 124
     fi
@@ -1962,6 +1971,7 @@ safe_sudo_remove() {
         else
             log_operation "${MOLE_CURRENT_COMMAND:-clean}" "FAILED" "$path" "removal timed out"
             MOLE_CLEAN_REMOVAL_TIMEOUTS=$((${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} + 1))
+            _mole_record_removal_timeout_path "$path"
         fi
         return 124
     fi
