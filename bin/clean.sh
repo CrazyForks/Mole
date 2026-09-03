@@ -1442,6 +1442,8 @@ start_cleanup() {
     export MOLE_CLEAN_SIZING_TIMEOUTS
     MOLE_CLEAN_REMOVAL_TIMEOUTS=0
     export MOLE_CLEAN_REMOVAL_TIMEOUTS
+    MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS=""
+    export MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS
     log_operation_session_start "clean"
     DRY_RUN_SEEN_IDENTITIES=()
     DRY_RUN_TOTAL_PARTIAL=false
@@ -1964,7 +1966,29 @@ perform_cleanup() {
     fi
 
     if [[ ${MOLE_CLEAN_REMOVAL_TIMEOUTS:-0} -gt 0 ]]; then
-        summary_details+=("${GRAY}${ICON_WARNING}${NC} ${MOLE_CLEAN_REMOVAL_TIMEOUTS} item(s) exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s removal budget and may be only partly removed. Run clean again, or raise ${GRAY}MOLE_TIMEOUT_DISK_VERIFY_SEC${NC} for slower disks.")
+        # Name the timed-out paths so the note is actionable without opening
+        # the operation log. Cap the list: a pathological disk can time out on
+        # many items and the note must stay one line.
+        local removal_timeout_note="item(s) exceeded the ${MOLE_TIMEOUT_DISK_VERIFY_SEC}s removal budget and may be only partly removed"
+        local -a removal_timeout_paths=()
+        local removal_timeout_path
+        while IFS= read -r removal_timeout_path; do
+            [[ -n "$removal_timeout_path" ]] && removal_timeout_paths+=("$removal_timeout_path")
+        done <<< "${MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS:-}"
+        if [[ ${#removal_timeout_paths[@]} -gt 0 ]]; then
+            local removal_timeout_show=3
+            [[ ${#removal_timeout_paths[@]} -lt $removal_timeout_show ]] && removal_timeout_show=${#removal_timeout_paths[@]}
+            local removal_timeout_list=""
+            local removal_timeout_idx
+            for ((removal_timeout_idx = 0; removal_timeout_idx < removal_timeout_show; removal_timeout_idx++)); do
+                removal_timeout_list+="${removal_timeout_list:+, }${removal_timeout_paths[$removal_timeout_idx]}"
+            done
+            if [[ ${#removal_timeout_paths[@]} -gt $removal_timeout_show ]]; then
+                removal_timeout_list+=", +$((${#removal_timeout_paths[@]} - removal_timeout_show)) more"
+            fi
+            removal_timeout_note+=": ${removal_timeout_list}"
+        fi
+        summary_details+=("${GRAY}${ICON_WARNING}${NC} ${MOLE_CLEAN_REMOVAL_TIMEOUTS} ${removal_timeout_note}. Run clean again, or raise ${GRAY}MOLE_TIMEOUT_DISK_VERIFY_SEC${NC} for slower disks.")
     fi
 
     if [[ $had_errexit -eq 1 ]]; then

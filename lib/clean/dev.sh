@@ -1808,10 +1808,22 @@ clean_xcode_xctest_devices() {
         return 0
     fi
 
+    # Test clones accumulate one UUID directory per test run, so the root
+    # grows without bound and a single-tree removal can exceed the per-item
+    # removal budget after deleting only part of it. Delete each entry
+    # separately so the budget, sink guard, and sizing apply per clone. The
+    # root itself stays: Xcode recreates clones inside it.
+    local -a device_entries=()
+    local device_entry
+    while IFS= read -r -d '' device_entry; do
+        device_entries+=("$device_entry")
+    done < <(command find "$xctest_devices_dir" -mindepth 1 -maxdepth 1 -print0 2> /dev/null)
+    [[ ${#device_entries[@]} -gt 0 ]] || return 0
+
     _xcode_safe_clean_guarded \
         _xctest_devices_delete_guard_allows \
         "Xcode XCTestDevices" \
-        "$xctest_devices_dir" \
+        "${device_entries[@]}" \
         "Xcode XCTestDevices test data" || true
 }
 
