@@ -70,6 +70,15 @@ mole_identity_in_list() {
     return 1
 }
 
+# Read top-level keys from a flat JSON object. macOS 15 plutil -p rejects raw
+# JSON; convert to plist XML first (#1512).
+_mole_read_json_object_keys() {
+    local json_file="$1"
+    plutil -convert xml1 -o - "$json_file" 2> /dev/null |
+        plutil -p - 2> /dev/null |
+        sed -nE 's/^[[:space:]]*"([^"]+)"[[:space:]]*=>.*/\1/p'
+}
+
 # True when a launcher entry provably belongs to a REMOVED Homebrew keg: a
 # dangling symlink into Cellar/mole, or a regular file whose brew-written
 # SCRIPT_DIR line names a Cellar/mole path that no longer exists (the #1488
