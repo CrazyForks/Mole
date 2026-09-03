@@ -66,7 +66,8 @@ setup_file() {
     [[ "$output" == *"94%"* ]] || { echo "$output"; return 1; }
     # The largest process must appear — a header-vs-sort bug once dropped it.
     [[ "$output" == *"VirtualMachine"* ]] || { echo "$output"; return 1; }
-    [[ "$output" == *"8.2 GB"* ]] || { echo "$output"; return 1; }
+    # Decimal GB from bytes_to_human, the formatter the rest of Mole uses.
+    [[ "$output" == *"8.81GB"* ]] || { echo "$output"; return 1; }
     # Basename only, and sub-1GB noise excluded.
     [[ "$output" != *"/usr/local/bin/codex"* ]] || return 1
     [[ "$output" != *"tiny"* ]] || return 1
@@ -86,7 +87,7 @@ setup_file() {
         opt_diag_idle_vm
     "
     [ "$status" -eq 0 ]
-    [[ "$output" == *"8.2GB"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"8.81GB"* ]] || { echo "$output"; return 1; }
     [[ "$output" == *"no running containers"* ]] || { echo "$output"; return 1; }
     [[ "$output" == *"likely Docker Desktop"* ]] || { echo "$output"; return 1; }
 }
@@ -182,4 +183,66 @@ setup_file() {
     [ "${lines[0]}" -eq 50 ]
     [ "${lines[1]}" -eq 50 ]
     [ "${lines[2]}" -eq 70 ]
+}
+
+@test "the size column stays aligned when a long name is truncated" {
+    run /bin/bash -c "
+        source '$PROJECT_ROOT/lib/core/common.sh'
+        source '$PROJECT_ROOT/lib/optimize/diagnostics.sh'
+        sysctl() { echo 'total = 16384.00M  used = 15500.00M  free = 884.00M'; }
+        memory_pressure() { echo 'System-wide memory free percentage: 8%'; }
+        ps() { printf '%s\n' '   RSS COMM' '8600000 com.apple.Virtualization.VirtualMachine' '2000000 codex'; }
+        opt_diag_memory_pressure | sed 's/\x1b\[[0-9;]*m//g' | grep -E '^    [^ ]' |
+            while IFS= read -r row; do
+                LC_ALL=C printf '%s' \"\${row%%GB*}\" | LC_ALL=C wc -c
+            done
+    "
+    [ "$status" -eq 0 ]
+    # Everything before the size is ASCII except the ellipsis on the truncated
+    # row, which is three bytes wide and one column wide. Padding that string
+    # with printf "%-28s" counted the bytes and pulled its size field two
+    # columns left of every other row.
+    local truncated_bytes="${lines[0]// /}"
+    local plain_bytes="${lines[1]// /}"
+    [ "$truncated_bytes" -eq $((plain_bytes + 2)) ] || {
+        echo "truncated=$truncated_bytes plain=$plain_bytes"
+        return 1
+    }
+}
+
+@test "a small swap file reports real sizes, not 0GB" {
+    run /bin/bash -c "
+        source '$PROJECT_ROOT/lib/core/common.sh'
+        source '$PROJECT_ROOT/lib/optimize/diagnostics.sh'
+        sysctl() { echo 'total = 1024.00M  used = 900.00M  free = 124.00M'; }
+        memory_pressure() { echo 'System-wide memory free percentage: 8%'; }
+        ps() { printf '%s\n' '   RSS COMM' '100 tiny'; }
+        opt_diag_memory_pressure
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"0GB of"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"943.7MB of 1.07GB"* ]] || { echo "$output"; return 1; }
+}
+
+@test "the runaway scan does not fork per process row" {
+    # It read two timestamps and four fields per row through the shell, six
+    # forks for each of 400 rows, and every optimize run paid ~5s for it even
+    # when nothing was wrong.
+    run /bin/bash -c "
+        source '$PROJECT_ROOT/lib/core/common.sh'
+        source '$PROJECT_ROOT/lib/optimize/diagnostics.sh'
+        ps() {
+            local i=0
+            echo 'PID TIME ELAPSED COMM'
+            while [ \$i -lt 400 ]; do
+                echo \"\$i 00:10 16-08:00:00 quietd\$i\"
+                i=\$((i + 1))
+            done
+        }
+        start=\$(date +%s)
+        opt_diag_runaway_process || true
+        echo \"ELAPSED=\$((\$(date +%s) - start))\"
+    "
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ELAPSED=0"* || "$output" == *"ELAPSED=1"* ]] || { echo "$output"; return 1; }
 }

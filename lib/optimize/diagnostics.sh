@@ -519,20 +519,26 @@ opt_diag_int_env() {
 }
 
 # Convert ps time/etime ([[dd-]hh:]mm:ss) to seconds. Returns 0 on garbage so a
-# malformed row can never inflate a ratio into a false runaway report.
+# malformed row can never inflate a ratio into a false runaway report. Shared
+# as awk source rather than a shell function because the runaway scan reads
+# two of these per row across hundreds of rows, and paying a fork for each one
+# cost five seconds of every optimize run.
+readonly MOLE_OPT_DIAG_TIME_AWK='
+function opt_secs(t,   n, a, p, d, first, h, m, s) {
+    d = 0
+    n = split(t, a, ":")
+    if (n < 2 || n > 3) return 0
+    first = a[1]
+    if (first ~ /-/) { split(first, p, "-"); d = p[1]; first = p[2] }
+    if (n == 3) { h = first; m = a[2]; s = a[3] }
+    else        { h = 0;     m = first; s = a[2] }
+    if (d !~ /^[0-9]+$/ || h !~ /^[0-9]+$/ || m !~ /^[0-9]+$/ || s !~ /^[0-9.]+$/) return 0
+    return d * 86400 + h * 3600 + m * 60 + s
+}
+'
+
 opt_diag_time_to_seconds() {
-    printf '%s\n' "${1:-}" | awk -F: '
-        BEGIN { d = 0 }
-        {
-            n = NF
-            if (n < 2 || n > 3) { print 0; exit }
-            first = $1
-            if (first ~ /-/) { split(first, p, "-"); d = p[1]; first = p[2] }
-            if (n == 3) { h = first; m = $2; s = $3 }
-            else        { h = 0;     m = first; s = $2 }
-            if (h !~ /^[0-9]+$/ || m !~ /^[0-9]+$/ || s !~ /^[0-9.]+$/) { print 0; exit }
-            printf "%d\n", d * 86400 + h * 3600 + m * 60 + s
-        }'
+    printf '%s\n' "${1:-}" | awk "$MOLE_OPT_DIAG_TIME_AWK"'{ printf "%d\n", opt_secs($0) }'
 }
 
 # Swap pressure, and the processes actually responsible for it. Silent when
@@ -557,15 +563,17 @@ opt_diag_memory_pressure() {
         return 0
     fi
 
-    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Memory pressure: swap $((swap_used / 1024))GB of $((swap_total / 1024))GB used (${swap_pct}%), ${free_pct}% free"
+    # bytes_to_human, not integer GB: sysctl reports megabytes, so "used / 1024"
+    # printed "swap 0GB of 1GB used (88%)" on a machine with a small swap file.
+    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Memory pressure: swap $(bytes_to_human_kb "$((swap_used * 1024))") of $(bytes_to_human_kb "$((swap_total * 1024))") used (${swap_pct}%), ${free_pct}% free"
     echo -e "  ${GRAY}${ICON_REVIEW}${NC} High load with little CPU activity is usually this, not compute"
 
     # Name the actual holders. Simulator runtimes ship duplicate daemons whose
     # rows would otherwise crowd out the real offenders.
-    local shown=0
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        echo -e "    ${GRAY}${line}${NC}"
+    local shown=0 holder_kb holder_name
+    while IFS=$'\t' read -r holder_kb holder_name; do
+        [[ -n "$holder_name" ]] || continue
+        echo -e "    ${GRAY}${holder_name}$(bytes_to_human_kb "$holder_kb")${NC}"
         shown=$((shown + 1))
         # The ps header is stripped inside opt_diag_get_rss_sample, BEFORE the
         # sort here. Filtering it afterwards with NR>1 would discard the
@@ -588,10 +596,19 @@ opt_diag_memory_pressure() {
                 # Truncate from the LEFT. These are often reverse-DNS names
                 # where the tail identifies the process
                 # ("com.apple.Virtualization.VirtualMachine"); keeping the head
-                # would print "com.apple.Virtualization.…" and hide which
-                # service it actually is.
-                if (length(name) > 26) name = "\xe2\x80\xa6" substr(name, length(name) - 24)
-                printf "%-28s %5.1f GB\n", name, kb/1048576
+                # would hide which service it actually is.
+                prefix = ""
+                if (length(name) > 26) {
+                    name = substr(name, length(name) - 24)
+                    prefix = "\xe2\x80\xa6"
+                }
+                # Pad here, on the ASCII name, and add the ellipsis after.
+                # printf "%-28s" counts bytes, so padding a string that already
+                # carried the three-byte ellipsis pulled the size column two
+                # places left on exactly the rows that were truncated.
+                pad = 28 - length(name) - (prefix == "" ? 0 : 1)
+                if (pad < 1) pad = 1
+                printf "%s\t%s%s%*s\n", kb, prefix, name, pad, ""
              }' |
         head -4)
     [[ "$shown" -gt 0 ]] || echo -e "    ${GRAY}pressure is spread across many small processes${NC}"
@@ -609,7 +626,7 @@ opt_diag_idle_vm() {
         awk '/Virtualization.framework.*VirtualMachine/ {s += $1} END {print s + 0}')
     [[ "$vm_kb" =~ ^[0-9]+$ ]] || return 0
     [[ "$vm_kb" -gt $((min_gb * 1048576)) ]] || return 0
-    vm_gb=$(awk -v k="$vm_kb" 'BEGIN {printf "%.1f", k/1048576}')
+    vm_gb=$(bytes_to_human_kb "$vm_kb")
 
     # Only claim it is idle if the owner agrees. A probe that cannot answer
     # must not produce a "safe to quit" recommendation.
@@ -620,14 +637,14 @@ opt_diag_idle_vm() {
 
     if [[ "$running" == "0" ]]; then
         if command -v docker > /dev/null 2>&1; then
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Virtual machine holding ${vm_gb}GB with no running containers (likely Docker Desktop)"
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Virtual machine holding ${vm_gb} with no running containers (likely Docker Desktop)"
             echo -e "  ${GRAY}${ICON_REVIEW}${NC} If this is Docker Desktop, quitting it reclaims all of it; it reserves memory even when idle"
         else
-            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Virtual machine holding ${vm_gb}GB"
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Virtual machine holding ${vm_gb}"
             echo -e "  ${GRAY}${ICON_REVIEW}${NC} Check Docker Desktop, UTM, or other virtualization tools for reclaimable memory"
         fi
     else
-        echo -e "  ${GRAY}${ICON_LIST}${NC} Virtual machine using ${vm_gb}GB${running:+ (${running} containers running)}"
+        echo -e "  ${GRAY}${ICON_LIST}${NC} Virtual machine using ${vm_gb}${running:+ (${running} containers running)}"
     fi
     return 0
 }
@@ -640,38 +657,37 @@ opt_diag_runaway_process() {
     pct_floor=$(opt_diag_int_env "${MOLE_OPTIMIZE_RUNAWAY_PCT:-}" "$MOLE_OPTIMIZE_RUNAWAY_PCT_DEFAULT")
     min_hours=$(opt_diag_int_env "${MOLE_OPTIMIZE_RUNAWAY_MIN_HOURS:-}" "$MOLE_OPTIMIZE_RUNAWAY_MIN_HOURS_DEFAULT")
 
-    local found=1 pid comm cputime etime cpu_s el_s pct hours
-    while IFS= read -r line; do
-        [[ -n "$line" ]] || continue
-        pid=$(printf '%s\n' "$line" | awk '{print $1}')
-        cputime=$(printf '%s\n' "$line" | awk '{print $2}')
-        etime=$(printf '%s\n' "$line" | awk '{print $3}')
-        comm=$(printf '%s\n' "$line" | awk '{for (i=4; i<=NF; i++) printf "%s%s", $i, (i<NF?" ":"")}')
-        comm="${comm##*/}"
-
-        # kernel_task is expected to accumulate CPU; it is thermal management,
-        # not a stuck process, and reporting it would be noise every run.
-        [[ "$comm" == "kernel_task" ]] && continue
-        # WindowServer and the other scanned families are already headlined by
-        # the family CPU check above; repeating them here would double-report
-        # a single problem under two different names.
-        case "$comm" in
-            WindowServer | mds | mds_stores | mdworker* | syspolicyd) continue ;;
-        esac
-
-        cpu_s=$(opt_diag_time_to_seconds "$cputime")
-        el_s=$(opt_diag_time_to_seconds "$etime")
-        [[ "$el_s" -gt $((min_hours * 3600)) ]] || continue
-        [[ "$cpu_s" -gt 0 ]] || continue
-
-        pct=$((cpu_s * 100 / el_s))
-        [[ "$pct" -ge "$pct_floor" ]] || continue
-
-        hours=$((cpu_s / 3600))
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${comm} has burned ${hours}h CPU over $((el_s / 3600))h of runtime (~${pct}% sustained)"
+    # The whole scan is one awk pass. Splitting fields and converting two
+    # timestamps per row in the shell cost six forks for each of 400 rows,
+    # which measured 5.1s on a 1000-process machine even when it found
+    # nothing, and every optimize run paid it.
+    local found=1 pid comm cpu_hours run_hours pct
+    while IFS=$'\t' read -r pid comm cpu_hours run_hours pct; do
+        [[ -n "$pid" ]] || continue
+        echo -e "  ${YELLOW}${ICON_WARNING}${NC} ${comm} has burned ${cpu_hours}h CPU over ${run_hours}h of runtime (~${pct}% sustained)"
         echo -e "  ${GRAY}${ICON_REVIEW}${NC} A stuck run loop. Restarting it usually clears it: ${NC}kill -TERM ${pid}${GRAY} (launchd respawns system daemons)${NC}"
         found=0
-    done < <(opt_diag_get_proctime_sample | head -400)
+    done < <(opt_diag_get_proctime_sample | head -400 |
+        awk -v floor="$pct_floor" -v minh="$min_hours" "$MOLE_OPT_DIAG_TIME_AWK"'
+        NF >= 4 {
+            name = ""
+            for (i = 4; i <= NF; i++) name = name (i > 4 ? " " : "") $i
+            sub(/^.*\//, "", name)
+            # kernel_task is expected to accumulate CPU; it is thermal
+            # management, not a stuck process, and reporting it would be noise
+            # every run. WindowServer and the other scanned families are
+            # already headlined by the family CPU check above, so repeating
+            # them here would double-report one problem under two names.
+            if (name == "kernel_task" || name == "WindowServer" || name == "mds" ||
+                name == "mds_stores" || name == "syspolicyd" || name ~ /^mdworker/) next
+            el = opt_secs($3)
+            if (el <= minh * 3600) next
+            cpu = opt_secs($2)
+            if (cpu <= 0) next
+            pct = int(cpu * 100 / el)
+            if (pct < floor) next
+            printf "%s\t%s\t%d\t%d\t%d\n", $1, name, cpu / 3600, el / 3600, pct
+        }')
 
     return "$found"
 }
