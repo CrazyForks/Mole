@@ -2156,7 +2156,7 @@ EOF
     [[ "$output" == *"Developer tools"*"Nothing to clean"* ]]
 }
 
-@test "clean_dev_mobile uses one successful simctl list for probe and data" {
+@test "clean_dev_mobile probes simctl once per question and never twice for one" {
     local call_log="$HOME/simctl-single-list.log"
 
     run env HOME="$HOME" PROJECT_ROOT="$PROJECT_ROOT" DRY_RUN=true \
@@ -2192,8 +2192,28 @@ EOF
         echo "$output"
         return 1
     }
-    [ "$(wc -l < "$call_log" | tr -d ' ')" -eq 1 ] || return 1
-    [ "$(< "$call_log")" = "list devices unavailable" ] || return 1
+    # The unavailable-simulator step still resolves probe and data from a
+    # single call; that is the invariant this test was written for.
+    [ "$(grep -c '^list devices unavailable$' "$call_log" | tr -d ' ')" -eq 1 ] || {
+        cat "$call_log"
+        return 1
+    }
+    [ "$(sed -n 1p "$call_log")" = "list devices unavailable" ] || return 1
+    # The orphaned-runtime review reads two more payloads, and it reads them
+    # through _run_simctl so they stay visible here. Routing around the shared
+    # helper would hide the cost from this assertion rather than remove it.
+    [ "$(sed -n 2p "$call_log")" = "runtime list -j" ] || {
+        cat "$call_log"
+        return 1
+    }
+    [ "$(sed -n 3p "$call_log")" = "list devices -j" ] || {
+        cat "$call_log"
+        return 1
+    }
+    [ "$(wc -l < "$call_log" | tr -d ' ')" -eq 3 ] || {
+        cat "$call_log"
+        return 1
+    }
 }
 
 @test "clean_dev_mobile continues cleanup when simctl is unavailable" {

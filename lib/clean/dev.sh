@@ -2759,13 +2759,93 @@ _debug_simctl_probe_stderr() {
 # other downloaded toolchain roots do; the value here is naming the exact
 # orphan and the owner command, which is information the user cannot get
 # from simctl directly.
+#
+# The join keys on runtimeIdentifier from `-j` output, never on the printed
+# runtime name. The two human-readable listings disagree by design: `runtime
+# list` heads each image with the image version ("iOS 26.4.1") while `list
+# devices` groups under the runtime's short name ("iOS 26.4"), so a name join
+# calls every point release an orphan and tells the user to delete a runtime
+# its simulators are still bound to.
+
+# One tab-separated row per orphaned runtime image: id, platform, version,
+# build, sizeBytes. Reads both `-j` payloads in a single awk pass, devices
+# first, then joins on runtimeIdentifier.
+#
+# A row survives only on complete evidence. The image must be Ready and
+# deletable, so nothing mid-download or owned by Xcode itself is offered. Its
+# runtime identifier must be served by exactly one installed image, because
+# the device list keys on the identifier and cannot say which of two images
+# the devices belong to. And udid entries are counted rather than trusting how
+# an empty array happens to be rendered.
+_simctl_orphan_runtime_rows() {
+    printf '%s\n=== MOLE RUNTIME PAYLOAD ===\n%s\n' "$1" "$2" | awk '
+        function val(line,   v) {
+            v = line
+            sub(/^ *"[^"]+" *: */, "", v)
+            sub(/,$/, "", v)
+            gsub(/^"|"$/, "", v)
+            return v
+        }
+        function key(line,   k) {
+            k = line
+            sub(/^ *"/, "", k)
+            sub(/" *:.*$/, "", k)
+            return k
+        }
+        function flush_device_group() {
+            if (group != "" && members > 0) used[group] = 1
+            group = ""
+            members = 0
+        }
+        function flush_runtime_image() {
+            if (id == "" || rid == "") return
+            n++
+            r_id[n] = id
+            r_rid[n] = rid
+            r_ver[n] = ver
+            r_build[n] = build
+            r_size[n] = size
+            r_del[n] = del
+            r_state[n] = state
+            served[rid]++
+            id = ""; rid = ""; ver = ""; build = ""; size = ""; del = ""; state = ""
+        }
+        /^=== MOLE RUNTIME PAYLOAD ===$/ { flush_device_group(); phase = 2; next }
+        phase != 2 {
+            if (!in_devices) { if ($0 ~ /^  "devices" *:/) in_devices = 1; next }
+            if ($0 ~ /^    "/) { flush_device_group(); group = key($0); next }
+            if ($0 ~ /^  \}/) { flush_device_group(); in_devices = 0; next }
+            if ($0 ~ /"udid"/) members++
+            next
+        }
+        /^  "[^"]+" *: *\{/ { flush_runtime_image(); id = key($0); next }
+        /^    "runtimeIdentifier" *:/ { rid = val($0); next }
+        /^    "version" *:/ { ver = val($0); next }
+        /^    "build" *:/ { build = val($0); next }
+        /^    "sizeBytes" *:/ { size = val($0); next }
+        /^    "deletable" *:/ { del = val($0); next }
+        /^    "state" *:/ { state = val($0); next }
+        END {
+            flush_runtime_image()
+            for (i = 1; i <= n; i++) {
+                if (r_state[i] != "Ready" || r_del[i] != "true") continue
+                if (served[r_rid[i]] != 1) continue
+                if (r_rid[i] in used) continue
+                platform = r_rid[i]
+                sub(/^.*\./, "", platform)
+                sub(/-.*$/, "", platform)
+                if (platform == "") platform = "Simulator"
+                printf "%s\t%s\t%s\t%s\t%s\n", r_id[i], platform, r_ver[i], r_build[i], r_size[i]
+            }
+        }'
+}
+
 check_orphaned_simulator_runtimes() {
     command -v xcrun > /dev/null 2>&1 || return 0
     [[ "${_MOLE_SIMCTL_RESOLUTION_STATUS:-}" == "ready" ]] || return 0
 
-    local runtime_list="" device_list="" probe_status=0
-    runtime_list=$(run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" \
-        env DEVELOPER_DIR="$_MOLE_SIMCTL_DEVELOPER_DIR" xcrun simctl runtime list -v 2> /dev/null) || probe_status=$?
+    local runtime_json="" device_json="" probe_status=0
+    runtime_json=$(_run_simctl "$MOLE_TIMEOUT_PKG_LIST_SEC" runtime list -j 2> /dev/null) || probe_status=$?
     if [[ $probe_status -ne 0 ]]; then
         [[ $probe_status -eq 124 || $probe_status -ge 128 ]] && return "$probe_status"
         debug_log "Orphaned runtime probe failed (exit=$probe_status)"
@@ -2773,67 +2853,26 @@ check_orphaned_simulator_runtimes() {
     fi
 
     probe_status=0
-    device_list=$(run_with_timeout "$MOLE_TIMEOUT_PKG_LIST_SEC" \
-        env DEVELOPER_DIR="$_MOLE_SIMCTL_DEVELOPER_DIR" xcrun simctl list devices 2> /dev/null) || probe_status=$?
+    device_json=$(_run_simctl "$MOLE_TIMEOUT_PKG_LIST_SEC" list devices -j 2> /dev/null) || probe_status=$?
     if [[ $probe_status -ne 0 ]]; then
         [[ $probe_status -eq 124 || $probe_status -ge 128 ]] && return "$probe_status"
         debug_log "Orphaned runtime device probe failed (exit=$probe_status)"
         return 0
     fi
+    # Without a recognizable device payload there is no evidence of absence,
+    # only absence of evidence.
+    [[ "$device_json" == *'"devices"'* ]] || return 0
 
-    # `simctl runtime list -v` prints a header line per runtime followed by
-    # indented detail lines, one of which carries the on-disk size:
-    #   iOS 18.4 (22E238) - 70DF9A83-... (Ready)
-    #       Size: 8.2G
-    local current_name="" current_id="" current_size=""
-    local -a orphan_lines=()
-    while IFS= read -r line; do
-        if [[ "$line" =~ ^([A-Za-z]+[[:space:]][0-9.]+)[[:space:]]\(.*\)[[:space:]]-[[:space:]]([0-9A-F-]{36}) ]]; then
-            # Flush the previous runtime before starting a new one.
-            _flush_orphan_runtime_candidate
-            current_name="${BASH_REMATCH[1]}"
-            current_id="${BASH_REMATCH[2]}"
-            current_size=""
-        elif [[ -n "$current_id" && "$line" =~ ^[[:space:]]+Size:[[:space:]]+(.+)$ ]]; then
-            current_size="${BASH_REMATCH[1]}"
-        fi
-    done <<< "$runtime_list"
-    _flush_orphan_runtime_candidate
-
-    # Expanding an empty array under `set -u` is an unbound-variable error on
-    # the bash 3.2 macOS ships, and "no orphans" is the common path.
-    [[ ${#orphan_lines[@]} -gt 0 ]] || return 0
-
-    local orphan
-    for orphan in "${orphan_lines[@]}"; do
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Orphaned simulator runtime · ${orphan}"
+    local id platform version build size_bytes size_note build_note
+    while IFS=$'\t' read -r id platform version build size_bytes; do
+        [[ -n "$id" && -n "$platform" ]] || continue
+        size_note=""
+        [[ "$size_bytes" =~ ^[0-9]+$ ]] && size_note=", $(bytes_to_human "$size_bytes")"
+        build_note="${build:+ ($build)}"
+        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Orphaned simulator runtime · ${platform} ${version}${build_note}${size_note} · no devices · remove with ${GRAY}xcrun simctl runtime delete ${id}${NC}"
         note_activity
-    done
+    done < <(_simctl_orphan_runtime_rows "$device_json" "$runtime_json")
     return 0
-}
-
-# Helper for check_orphaned_simulator_runtimes' parse loop: decide whether
-# the runtime just parsed has zero devices, and if so queue a review line.
-# Reads/writes the caller's locals by design (bash 3.2 has no namerefs).
-_flush_orphan_runtime_candidate() {
-    [[ -n "$current_id" && -n "$current_name" ]] || return 0
-
-    # Devices are grouped under a "-- <runtime name> --" header. Count the
-    # non-empty lines in this runtime's group; zero means orphaned.
-    local device_count
-    device_count=$(printf '%s\n' "$device_list" | awk -v want="-- ${current_name} --" '
-        index($0, want) == 1 { f = 1; next }
-        /^-- / { f = 0 }
-        f && NF { c++ }
-        END { print c + 0 }')
-
-    if [[ "$device_count" -eq 0 ]]; then
-        local size_note="${current_size:+, $current_size}"
-        orphan_lines+=("${current_name}${size_note} · no devices · remove with ${GRAY}xcrun simctl runtime delete ${current_id}${NC}")
-    fi
-    current_id=""
-    current_name=""
-    current_size=""
 }
 
 clean_dev_mobile() {
@@ -3923,19 +3962,29 @@ clean_claude_desktop_bundled_versions() {
 # Headless browser trees leaked by dead Playwright/agent automation sessions.
 # When an MCP server or agent harness dies without cleanup, its browser
 # daemons reparent to launchd (ppid 1) and the Chrome tree keeps running
-# headless, holding RSS; the ephemeral temp profiles keep disk. Only
-# processes tied to playwright_chromiumdev_profile-* automation profiles are
-# ever touched, never a user's real browser: orphaned Playwright daemons at
-# any age, browser processes only after a full day (a younger one may belong
-# to a live automation session).
+# headless, holding RSS; the ephemeral temp profiles keep disk.
+#
+# Only processes tied to playwright_chromiumdev_profile-* automation profiles
+# are ever touched, never a user's real browser, and the evidence of a leak is
+# ppid 1: the harness that owned this browser is gone. That is a fact about
+# the session rather than a guess from age, so it protects a live automation
+# run of any length (its parent is still alive) while catching a leak minutes
+# after it happens instead of a day later. The one-hour floor only keeps the
+# scan away from a browser that is mid-handoff between two parents.
+#
+# Chrome helper processes keep the main browser as their parent, so this
+# matches roots only and the tree follows them down.
 clean_dev_automation_browsers() {
     local -a leaked_pids=()
     local pid
     while IFS= read -r pid; do
         [[ -n "$pid" ]] && leaked_pids+=("$pid")
     done < <(ps -Ao pid=,ppid=,etime=,command= 2> /dev/null | awk '
-        /playwright-core\/lib\/entry\/cliDaemon\.js/ && $2 == 1 { print $1; next }
-        /playwright_chromiumdev_profile/ && $3 ~ /-/ { print $1 }' | sort -un)
+        $2 != 1 { next }
+        # ps prints mm:ss below an hour and hh:mm:ss or dd-hh:mm:ss above it.
+        $3 !~ /-/ && $3 !~ /^[0-9]+:[0-9][0-9]:[0-9][0-9]$/ { next }
+        /playwright-core\/lib\/entry\/cliDaemon\.js/ { print $1; next }
+        /playwright_chromiumdev_profile/ { print $1 }' | sort -un)
 
     # Ephemeral automation profiles: stale after 2h, and never one that a
     # live process still references.

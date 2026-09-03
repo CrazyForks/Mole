@@ -23,18 +23,20 @@ teardown_file() {
     fi
 }
 
-# Stub binaries: ps emits one orphaned cliDaemon (ppid 1), one day-old Chrome
-# on an automation profile, one FRESH Chrome on an automation profile (must
-# survive), and one unrelated browser (must survive). getconf points the
-# profile scan at the test temp root.
+# Stub binaries: ps emits one orphaned cliDaemon (ppid 1), one reparented
+# Chrome on an automation profile, one automation Chrome whose harness is
+# still alive (must survive), one reparented automation Chrome too young to
+# judge (must survive), and one unrelated browser (must survive). getconf
+# points the profile scan at the test temp root.
 make_process_stubs() {
     mkdir -p "$HOME/bin" "$HOME/tmproot"
     cat > "$HOME/bin/ps" <<'SCRIPT'
 #!/bin/bash
 printf '%s\n' \
     '  901     1 02-01:00:00 /opt/homebrew/bin/node playwright-core/lib/entry/cliDaemon.js daemon' \
-    '  902   901 01-20:00:00 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-old' \
-    '  903   901    05:00 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-new' \
+    '  902     1 01-20:00:00 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-old' \
+    '  903   777 06-20:00:00 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-live' \
+    '  905     1    05:00 /Applications/Chrome.app/x --user-data-dir=/tmp/playwright_chromiumdev_profile-new' \
     '  904     1 03-01:00:00 /Applications/Safari.app/Contents/MacOS/Safari'
 SCRIPT
     cat > "$HOME/bin/getconf" <<SCRIPT
@@ -76,7 +78,7 @@ clean_dev_automation_browsers
 EOF
 }
 
-@test "kills only orphaned daemons and day-old automation browsers" {
+@test "kills only automation processes whose owner is gone" {
     make_process_stubs
     : > "$HOME/kill.trace"
 
@@ -85,8 +87,12 @@ EOF
     [[ "$output" == *"stopped 2 processes"* ]] || { echo "$output"; return 1; }
     grep -q 'KILL -TERM 901' "$HOME/kill.trace" || return 1
     grep -q 'KILL -TERM 902' "$HOME/kill.trace" || return 1
-    # Fresh automation session and the unrelated browser are never signaled.
+    # A live automation run keeps its parent, so it is never signaled however
+    # long it has been running. This is the call age alone cannot make.
     ! grep -q ' 903' "$HOME/kill.trace" || return 1
+    # Reparented but under an hour: possibly mid-handoff, so left alone.
+    ! grep -q ' 905' "$HOME/kill.trace" || return 1
+    # The unrelated browser is never touched.
     ! grep -q ' 904' "$HOME/kill.trace" || return 1
 }
 
