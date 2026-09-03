@@ -88,6 +88,7 @@ setup_file() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"8.2GB"* ]] || { echo "$output"; return 1; }
     [[ "$output" == *"no running containers"* ]] || { echo "$output"; return 1; }
+    [[ "$output" == *"likely Docker Desktop"* ]] || { echo "$output"; return 1; }
 }
 
 @test "idle VM does NOT claim reclaimable when containers are running" {

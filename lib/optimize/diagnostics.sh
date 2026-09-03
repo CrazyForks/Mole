@@ -619,8 +619,13 @@ opt_diag_idle_vm() {
     fi
 
     if [[ "$running" == "0" ]]; then
-        echo -e "  ${YELLOW}${ICON_WARNING}${NC} Docker Desktop VM holding ${vm_gb}GB with no running containers"
-        echo -e "  ${GRAY}${ICON_REVIEW}${NC} Quitting Docker Desktop reclaims all of it; it reserves memory even when idle"
+        if command -v docker > /dev/null 2>&1; then
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Virtual machine holding ${vm_gb}GB with no running containers (likely Docker Desktop)"
+            echo -e "  ${GRAY}${ICON_REVIEW}${NC} If this is Docker Desktop, quitting it reclaims all of it; it reserves memory even when idle"
+        else
+            echo -e "  ${YELLOW}${ICON_WARNING}${NC} Virtual machine holding ${vm_gb}GB"
+            echo -e "  ${GRAY}${ICON_REVIEW}${NC} Check Docker Desktop, UTM, or other virtualization tools for reclaimable memory"
+        fi
     else
         echo -e "  ${GRAY}${ICON_LIST}${NC} Virtual machine using ${vm_gb}GB${running:+ (${running} containers running)}"
     fi
