@@ -171,9 +171,8 @@ defer_cleanup_family() {
     debug_log "Deferred cleanup while active: $family"
 }
 
-# The Cloud & Office section runs in a timeout worker, so its array writes stay
-# in that child shell. Replay its file-backed records before rendering the
-# parent summary.
+# Replay file-backed deferred-family records before rendering the summary.
+# defer_cleanup_family writes through DEFERRED_CLEANUP_FAMILIES_FILE when set.
 sync_deferred_cleanup_families() {
     local record_file="${DEFERRED_CLEANUP_FAMILIES_FILE:-}"
     local family
@@ -834,6 +833,10 @@ _safe_clean_impl() {
         return "$pending_clean_cancel"
     fi
 
+    if _mole_clean_section_budget_spent; then
+        return 0
+    fi
+
     if [[ $# -eq 0 ]]; then
         return 0
     fi
@@ -877,6 +880,7 @@ _safe_clean_impl() {
     local removal_failed_count=0
     local delete_guard_stopped=0
     local cleanup_interrupt_rc=0
+    local section_deadline="${_MOLE_CLEAN_SECTION_DEADLINE:-}"
     # A guarded cleanup may bind the exact object it approved to safe_remove's
     # final identity check. These names deliberately use dynamic scope so the
     # callback can populate them without stdout/command-substitution races.
@@ -1168,6 +1172,9 @@ _safe_clean_impl() {
         idx=0
         if [[ ${#existing_paths[@]} -gt 0 ]]; then
             for path in "${existing_paths[@]}"; do
+                if _mole_clean_section_budget_spent; then
+                    break
+                fi
                 local result_file="$temp_dir/result_${idx}"
                 if [[ -f "$result_file" ]]; then
                     read -r size count size_unknown < "$result_file" 2> /dev/null || true
@@ -1197,7 +1204,7 @@ _safe_clean_impl() {
                             bound_parent_id="$_MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID"
                             bound_target_id="$_MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID"
                         fi
-                        safe_remove "$path" true "$size" "" \
+                        safe_remove "$path" true "$size" "$section_deadline" \
                             "$bound_parent" "$bound_parent_id" \
                             "$bound_target_id" || action_rc=$?
                         # A removal timeout (124) is a failed removal, not a
@@ -1267,6 +1274,9 @@ _safe_clean_impl() {
         local idx=0
         if [[ ${#existing_paths[@]} -gt 0 ]]; then
             for path in "${existing_paths[@]}"; do
+                if _mole_clean_section_budget_spent; then
+                    break
+                fi
                 local size_kb=0
                 local size_rc=0
                 size_kb=$(get_cleanup_path_size_kb "$path") || size_rc=$?
@@ -1305,7 +1315,7 @@ _safe_clean_impl() {
                         bound_parent_id="$_MOLE_SAFE_CLEAN_EXPECTED_PARENT_ID"
                         bound_target_id="$_MOLE_SAFE_CLEAN_EXPECTED_TARGET_ID"
                     fi
-                    safe_remove "$path" true "$size_kb" "" \
+                    safe_remove "$path" true "$size_kb" "$section_deadline" \
                         "$bound_parent" "$bound_parent_id" \
                         "$bound_target_id" || action_rc=$?
                     # Same non-fatal removal-timeout policy as the
@@ -1444,6 +1454,9 @@ start_cleanup() {
     export MOLE_CLEAN_REMOVAL_TIMEOUTS
     MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS=""
     export MOLE_CLEAN_REMOVAL_TIMEOUT_PATHS
+    MOLE_CLEAN_SECTION_BUDGET_HIT=0
+    export MOLE_CLEAN_SECTION_BUDGET_HIT
+    _MOLE_CLEAN_SECTION_DEADLINE=""
     log_operation_session_start "clean"
     DRY_RUN_SEEN_IDENTITIES=()
     DRY_RUN_TOTAL_PARTIAL=false
@@ -1718,22 +1731,18 @@ perform_cleanup() {
 
             # ===== 5. Cloud & Office =====
             start_section "Cloud & Office"
-            # Force shell fallback so timeout runs in this shell context.
-            # The Cloud/Office cleaners rely on helpers (safe_clean, whitelist checks)
-            # defined in this script and sourced modules.
             local _perf_cloud_office_start
             debug_timer_start _perf_cloud_office_start
             local cloud_office_rc=0
-            run_with_shell_timeout 300 run_cloud_and_office_cleanup || cloud_office_rc=$?
+            _run_cleanup_step run_cloud_and_office_cleanup || cloud_office_rc=$?
             debug_timer_end "cleanup step: run_cloud_and_office_cleanup" \
                 _perf_cloud_office_start
             if [[ $cloud_office_rc -ne 0 ]]; then
-                local ret=$cloud_office_rc
-                if [[ $ret -eq 124 || $ret -ge 128 ]]; then
-                    _mole_record_clean_cancellation "$ret"
-                    return "$ret"
+                if [[ $cloud_office_rc -eq 124 || $cloud_office_rc -ge 128 ]]; then
+                    _mole_record_clean_cancellation "$cloud_office_rc"
+                    return "$cloud_office_rc"
                 else
-                    log_warning "Cloud & Office cleanup failed with exit code $ret"
+                    log_warning "Cloud & Office cleanup failed with exit code $cloud_office_rc"
                 fi
             fi
             end_section
@@ -1840,6 +1849,8 @@ perform_cleanup() {
         elif [[ $cleanup_cancel_rc -ge 128 ]]; then
             summary_details+=("${GRAY}${ICON_WARNING}${NC} Cancelled: a cleanup step was interrupted (exit $cleanup_cancel_rc). Remaining cleanup was skipped.")
         fi
+    elif [[ "${MOLE_CLEAN_SECTION_BUDGET_HIT:-0}" == "1" ]]; then
+        summary_details+=("${GRAY}${ICON_WARNING}${NC} Cloud & Office · time limit reached, skipped remaining items")
     fi
 
     # Emit one "Free space" line, with the measured delta in parentheses when
@@ -1980,8 +1991,14 @@ perform_cleanup() {
             [[ ${#removal_timeout_paths[@]} -lt $removal_timeout_show ]] && removal_timeout_show=${#removal_timeout_paths[@]}
             local removal_timeout_list=""
             local removal_timeout_idx
+            local removal_timeout_display
             for ((removal_timeout_idx = 0; removal_timeout_idx < removal_timeout_show; removal_timeout_idx++)); do
-                removal_timeout_list+="${removal_timeout_list:+, }${removal_timeout_paths[$removal_timeout_idx]}"
+                # Abbreviate $HOME: three absolute paths under
+                # ~/Library/Developer already run past one terminal line, which
+                # is the width this note is capped to keep.
+                removal_timeout_display="${removal_timeout_paths[$removal_timeout_idx]}"
+                [[ -n "$HOME" && "$removal_timeout_display" == "$HOME"/* ]] && removal_timeout_display="~${removal_timeout_display#"$HOME"}"
+                removal_timeout_list+="${removal_timeout_list:+, }${removal_timeout_display}"
             done
             if [[ ${#removal_timeout_paths[@]} -gt $removal_timeout_show ]]; then
                 removal_timeout_list+=", +$((${#removal_timeout_paths[@]} - removal_timeout_show)) more"
@@ -2016,25 +2033,48 @@ run_with_shell_timeout() {
 run_cloud_and_office_cleanup() {
     local cleanup_rc=0
     local pending_clean_cancel=0
+    local previous_deadline="${_MOLE_CLEAN_SECTION_DEADLINE:-}"
+    local section_deadline=$((SECONDS + MOLE_CLOUD_OFFICE_SECTION_BUDGET_SEC))
+    _MOLE_CLEAN_SECTION_DEADLINE=$section_deadline
 
     clean_cloud_storage || cleanup_rc=$?
     pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
     if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
+        _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
         return "$cleanup_rc"
     fi
     if [[ $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
+        _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
         return "$pending_clean_cancel"
     fi
 
-    cleanup_rc=0
-    clean_office_applications || cleanup_rc=$?
-    pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
-    if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
-        return "$cleanup_rc"
+    if ! _mole_clean_section_budget_spent; then
+        cleanup_rc=0
+        clean_office_applications || cleanup_rc=$?
+        pending_clean_cancel="${MOLE_CLEAN_CANCEL_STATUS:-0}"
+        if [[ $cleanup_rc -eq 124 || $cleanup_rc -ge 128 ]]; then
+            _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
+            return "$cleanup_rc"
+        fi
+        if [[ $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
+            _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
+            return "$pending_clean_cancel"
+        fi
     fi
-    if [[ $pending_clean_cancel -eq 124 || $pending_clean_cancel -ge 128 ]]; then
-        return "$pending_clean_cancel"
+
+    local budget_hit=0
+    if [[ $SECONDS -ge $section_deadline ]]; then
+        budget_hit=1
     fi
+
+    _MOLE_CLEAN_SECTION_DEADLINE="$previous_deadline"
+
+    if [[ $budget_hit -eq 1 ]]; then
+        report_cloud_office_budget_reached
+        MOLE_CLEAN_SECTION_BUDGET_HIT=1
+        export MOLE_CLEAN_SECTION_BUDGET_HIT
+    fi
+
     return 0
 }
 

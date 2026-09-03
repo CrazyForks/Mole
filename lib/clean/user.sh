@@ -1871,6 +1871,13 @@ clean_cloud_storage() {
     fi
 }
 
+report_cloud_office_budget_reached() {
+    echo -e "  ${YELLOW}${ICON_WARNING}${NC} Cloud & Office · ${GRAY}time limit reached, skipped remaining items${NC}"
+    if declare -F note_activity > /dev/null 2>&1; then
+        note_activity
+    fi
+}
+
 # Office app caches.
 clean_office_applications() {
     # Bound every explicit Office App Container probe as one section.
