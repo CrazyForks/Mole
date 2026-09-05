@@ -33,7 +33,7 @@ files_cleaned=0
 total_size_cleaned=0
 
 readonly MOLE_UNINSTALL_META_CACHE_DIR="$HOME/.cache/mole"
-readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v2"
+readonly MOLE_UNINSTALL_META_CACHE_FILE="$MOLE_UNINSTALL_META_CACHE_DIR/uninstall_app_metadata_v3"
 readonly MOLE_UNINSTALL_META_CACHE_LOCK="${MOLE_UNINSTALL_META_CACHE_FILE}.lock"
 readonly MOLE_UNINSTALL_META_REFRESH_TTL=604800 # 7 days
 readonly MOLE_UNINSTALL_EPOCH_FLOOR=978307200
@@ -110,14 +110,118 @@ uninstall_inline_du_size_kb() {
     echo "0"
 }
 
+# The user's UI language preference, most preferred first. Resolved once per
+# run: `defaults` costs a fork, and the answer cannot change mid-scan. An empty
+# result (no `defaults`, or a fresh account with no array) simply skips the
+# localized lookup and leaves the bundle's unlocalized names in charge.
+mole_uninstall_preferred_languages() {
+    defaults read -g AppleLanguages 2> /dev/null |
+        sed -e 's/[()"]//g' -e 's/,//g' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' |
+        grep -v '^$'
+}
+
+# Directory names to try inside Contents/Resources for one BCP-47 tag, most
+# specific first. macOS bundles spell the same locale several ways, so
+# "zh-Hans-CN" has to reach a zh-Hans.lproj, a zh_CN.lproj or a bare zh.lproj.
+_uninstall_lproj_candidates() {
+    local tag="$1"
+    [[ -n "$tag" ]] || return 0
+
+    local base script region rest
+    base="${tag%%-*}"
+    rest="${tag#"$base"}"
+    rest="${rest#-}"
+    script=""
+    region=""
+    if [[ -n "$rest" ]]; then
+        local second="${rest%%-*}"
+        if [[ "$second" =~ ^[A-Z][a-z]{3}$ ]]; then
+            script="$second"
+            region="${rest#"$second"}"
+            region="${region#-}"
+        else
+            region="$second"
+        fi
+    fi
+
+    printf '%s\n' "$tag" "${tag//-/_}"
+    [[ -n "$script" ]] && printf '%s\n' "${base}-${script}" "${base}_${script}"
+    [[ -n "$region" ]] && printf '%s\n' "${base}_${region}" "${base}-${region}"
+    printf '%s\n' "$base"
+}
+
+readonly MOLE_UNINSTALL_PREFERRED_LANGS="$(mole_uninstall_preferred_languages)"
+
+# The bundle's own name for a locale, read from the same InfoPlist.strings that
+# Finder consults. Prints nothing when the bundle does not localize the name,
+# which leaves the caller on the unlocalized Info.plist values.
+#
+# The search stops at the first preferred language the bundle localizes at all,
+# and never continues into a language the user did not ask for. MiaoYan.app is
+# the case that rule exists for: it ships zh-Hans.lproj but no en.lproj, and an
+# English-preferring Mac shows "MiaoYan", not the Chinese name that happens to
+# be the only override present.
+_uninstall_localized_bundle_name() {
+    local app_path="$1"
+    local resources="$app_path/Contents/Resources"
+    [[ -d "$resources" ]] || return 0
+
+    local dev_region=""
+    dev_region=$(plutil -extract CFBundleDevelopmentRegion raw "$app_path/Contents/Info.plist" 2> /dev/null || echo "")
+    case "$dev_region" in
+        English) dev_region="en" ;;
+        Japanese) dev_region="ja" ;;
+        French) dev_region="fr" ;;
+        German) dev_region="de" ;;
+    esac
+    local dev_base="${dev_region%%-*}"
+
+    local lang candidate lproj=""
+    while IFS= read -r lang; do
+        [[ -n "$lang" ]] || continue
+        while IFS= read -r candidate; do
+            if [[ -d "$resources/$candidate.lproj" ]]; then
+                lproj="$resources/$candidate.lproj"
+                break
+            fi
+        done < <(_uninstall_lproj_candidates "$lang")
+        [[ -n "$lproj" ]] && break
+
+        # Base.lproj carries the development region, so a bundle with only
+        # Base.lproj still counts as localized for that language.
+        if [[ -n "$dev_base" && "${lang%%-*}" == "$dev_base" && -d "$resources/Base.lproj" ]]; then
+            lproj="$resources/Base.lproj"
+            break
+        fi
+    done <<< "$MOLE_UNINSTALL_PREFERRED_LANGS"
+
+    [[ -n "$lproj" && -f "$lproj/InfoPlist.strings" ]] || return 0
+
+    local localized
+    localized=$(plutil -extract CFBundleDisplayName raw -- "$lproj/InfoPlist.strings" 2> /dev/null || echo "")
+    if [[ -z "$localized" || "$localized" == "(null)" ]]; then
+        localized=$(plutil -extract CFBundleName raw -- "$lproj/InfoPlist.strings" 2> /dev/null || echo "")
+    fi
+    [[ -n "$localized" && "$localized" != "(null)" ]] || return 0
+    printf '%s' "$localized"
+}
+
 uninstall_resolve_display_name() {
     local app_path="$1"
     local app_name="$2"
     local display_name="$app_name"
 
     if [[ -f "$app_path/Contents/Info.plist" ]]; then
-        local md_display_name
-        if [[ -n "$MOLE_UNINSTALL_USER_LC_ALL" ]]; then
+        # The bundle's own localized name is what Finder shows, so it wins and
+        # spares the mdls fork. mdls only ever reports the on-disk file name for
+        # an app bundle, which is exactly the unrecognizable string this avoids.
+        local localized_name
+        localized_name=$(_uninstall_localized_bundle_name "$app_path")
+
+        local md_display_name=""
+        if [[ -n "$localized_name" ]]; then
+            :
+        elif [[ -n "$MOLE_UNINSTALL_USER_LC_ALL" ]]; then
             md_display_name=$(run_with_timeout "$MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC" env LC_ALL="$MOLE_UNINSTALL_USER_LC_ALL" LANG="$MOLE_UNINSTALL_USER_LANG" mdls -name kMDItemDisplayName -raw "$app_path" 2> /dev/null || echo "")
         elif [[ -n "$MOLE_UNINSTALL_USER_LANG" ]]; then
             md_display_name=$(run_with_timeout "$MOLE_UNINSTALL_INLINE_MDLS_DISPLAY_TIMEOUT_SEC" env LANG="$MOLE_UNINSTALL_USER_LANG" mdls -name kMDItemDisplayName -raw "$app_path" 2> /dev/null || echo "")
@@ -142,7 +246,9 @@ uninstall_resolve_display_name() {
         bundle_name="${bundle_name//|/-}"
         bundle_name="${bundle_name//[$'\t\r\n']/}"
 
-        if [[ -n "$md_display_name" && "$md_display_name" != "(null)" && "$md_display_name" != "$app_name" ]]; then
+        if [[ -n "$localized_name" ]]; then
+            display_name="$localized_name"
+        elif [[ -n "$md_display_name" && "$md_display_name" != "(null)" && "$md_display_name" != "$app_name" ]]; then
             display_name="$md_display_name"
         elif [[ -n "$bundle_display_name" && "$bundle_display_name" != "(null)" ]]; then
             display_name="$bundle_display_name"
