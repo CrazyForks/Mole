@@ -170,14 +170,13 @@ EOF
 # Every subcommand that rejects an option must do it the way bin/history.sh
 # already did: nothing on stdout, so `mo <cmd> --bogus > out` leaves the reason
 # on the terminal instead of burying it in the redirected file. analyze and
-# status word it differently because the rejection comes from the Go flag
-# package, so the pattern accepts both phrasings.
+# status are left to cmd/*/usage_test.go: their wrapper reports a missing
+# bundled binary instead, on jobs that do not build the Go helpers.
 @test "every subcommand sends its unknown-option diagnostic to stderr" {
 	local cmd out err
 	for cmd in "update --bogus" "remove --bogus" "optimize --bogus" \
 		"purge --bogus" "installer --bogus" "uninstall --bogus" \
-		"uninstall --whitelist" "history --bogus" \
-		"analyze --bogus" "status --bogus"; do
+		"uninstall --whitelist" "history --bogus"; do
 		out="$BATS_TEST_TMPDIR/opt.out"
 		err="$BATS_TEST_TMPDIR/opt.err"
 		run env HOME="$HOME" bash -c "'$PROJECT_ROOT/mole' $cmd > '$out' 2> '$err'"
