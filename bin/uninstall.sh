@@ -1560,14 +1560,14 @@ main() {
                 list_mode=1
                 ;;
             "--whitelist")
-                echo "Unknown uninstall option: $arg"
-                echo "Whitelist management is currently supported by: mo clean --whitelist / mo optimize --whitelist"
-                echo "Use 'mo uninstall --help' for supported options."
+                echo "Unknown uninstall option: $arg" >&2
+                echo "Whitelist management is currently supported by: mo clean --whitelist / mo optimize --whitelist" >&2
+                echo "Use 'mo uninstall --help' for supported options." >&2
                 exit 1
                 ;;
             -*)
-                echo "Unknown uninstall option: $arg"
-                echo "Use 'mo uninstall --help' for supported options."
+                echo "Unknown uninstall option: $arg" >&2
+                echo "Use 'mo uninstall --help' for supported options." >&2
                 exit 1
                 ;;
             *)

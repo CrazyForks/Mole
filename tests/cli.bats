@@ -167,6 +167,26 @@ EOF
 	grep -q "Unknown command: unknown-command" "$err" || { cat "$err"; return 1; }
 }
 
+# Every subcommand that rejects an option must do it the way bin/history.sh
+# already did: nothing on stdout, so `mo <cmd> --bogus > out` leaves the reason
+# on the terminal instead of burying it in the redirected file. analyze and
+# status word it differently because the rejection comes from the Go flag
+# package, so the pattern accepts both phrasings.
+@test "every subcommand sends its unknown-option diagnostic to stderr" {
+	local cmd out err
+	for cmd in "update --bogus" "remove --bogus" "optimize --bogus" \
+		"purge --bogus" "installer --bogus" "uninstall --bogus" \
+		"uninstall --whitelist" "history --bogus" \
+		"analyze --bogus" "status --bogus"; do
+		out="$BATS_TEST_TMPDIR/opt.out"
+		err="$BATS_TEST_TMPDIR/opt.err"
+		run env HOME="$HOME" bash -c "'$PROJECT_ROOT/mole' $cmd > '$out' 2> '$err'"
+		[ "$status" -ne 0 ] || { echo "mo $cmd exited 0"; return 1; }
+		[ ! -s "$out" ] || { echo "mo $cmd wrote to stdout:"; cat "$out"; return 1; }
+		grep -qiE "unknown|not defined" "$err" || { echo "mo $cmd stderr:"; cat "$err"; return 1; }
+	done
+}
+
 @test "mole --help does not list check command" {
 	run env HOME="$HOME" "$PROJECT_ROOT/mole" --help
 	[ "$status" -eq 0 ]
